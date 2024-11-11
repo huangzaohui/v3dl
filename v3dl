@@ -1,0 +1,831 @@
+#!/bin/bash
+
+# 脚本版本号
+SCRIPT_VERSION="1.0.8"
+
+# 函数：用法提醒
+usage_function() {
+  echo -e "Usage  : \033[33m$0 <options> [Optional Parameters]\033[0m"
+  echo ""
+  echo "Script Version: $SCRIPT_VERSION"
+  echo ""
+  echo "Example:"
+  echo -e "  \"\033[33m$0 app\033[0m\""
+  echo -e "  \"\033[33m$0 app PID=1234\033[0m\""
+  echo -e "  \"\033[33m$0 fm_ota SET_USER_DATA SYNC_TIME\033[0m\""
+  echo ""
+  echo "Options:"
+  echo "  ota                - OTA package"
+  echo "  fm_ota             - format, nvms, backup_fw, OTA package"
+  echo "  boot               - Boot firmware"
+  echo "  app                - Application firmware"
+  echo "  recovery           - Recovery firmware"
+  echo "  fct                - Factory test firmware"
+  echo "  coretest           - Core test firmware"
+  echo "  com                - Find all connected Watch-Link serial ports"
+  echo ""
+  echo "Optional Parameters:"
+  echo "  [-f path]          - Specify the firmware path"
+  echo "  [-d directory]     - Specify the firmware directory"
+  echo "  [PID=XXXX]         - Connect to the Watch-Link with the specified PID"
+  echo "  [BID=XXX]          - Specify target board ID"
+  echo "  [HW=0xXXXXXXXX]    - Set target board hardware revision (only with 'fm_ota')"
+  echo "  [WRITE_OTP]        - Write BID into the OTP memory of the target board"
+  echo "  [SET_USER_DATA]    - Set user data on the target board"
+  echo "  [SYNC_TIME]        - Synchronize time with the target board"
+  echo ""
+  exit 1
+}
+
+# 解析参数
+terminal_dir="$PWD"
+for arg in "$@"; do
+  if [ -z "$first_arg" ] && [[ "$arg" =~ ^(ota|boot|app|recovery|coretest|fct|fm_ota|com)$ ]]; then
+    first_arg="$arg"
+    if [ -z "$fw_type" ] && [[ "$arg" =~ ^(ota|boot|app|recovery|coretest|fct|fm_ota)$ ]]; then
+      fw_type="$arg"
+    elif [ -z "$find_com" ] && [[ "$arg" == "com" ]]; then
+      find_com="$arg"
+      if [ $# -gt 1 ]; then
+        echo -e "\033[31mError: Invalid command\033[0m"
+        exit 1
+      fi
+    fi
+  elif [ -z "$wl_pid" ] && [[ "$arg" =~ ^PID=[0-9a-fA-F]{4}$ ]]; then
+    wl_pid=$(echo "${arg#PID=}" | tr 'a-f' 'A-F')
+  elif [ -z "$tar_bid" ] && [[ "$arg" =~ ^BID=[0-9]{3}$ ]]; then
+    tar_bid="${arg#BID=}"
+  elif [ -z "$hw_rev" ] && [[ "$fw_type" == "fm_ota" ]] && [[ "$arg" =~ ^HW=0[xX][0-9a-fA-F]{6,8}$ ]]; then
+    hw_rev="${arg#HW=}"
+  elif [ -z "$write_otp" ] && [[ "$arg" == "WRITE_OTP" ]]; then
+    write_otp="cmd_write_otp"
+  elif [ -z "$set_user_data" ] && [[ "$arg" == "SET_USER_DATA" ]]; then
+    set_user_data="cmd_set_user_data"
+  elif [ -z "$sync_time" ] && [[ "$arg" == "SYNC_TIME" ]]; then
+    sync_time="sync_the_time.bat"
+  elif [ -z "$_f" ] && [[ "$arg" == "-f" ]]; then
+    _f="-f"
+    continue
+  elif [ "$_f" == "-f" ]; then
+    if [[ "$arg" == /* ]] && [ -f "$arg" ]; then
+      sepc_path="$(realpath "$arg")"
+    elif [[ "$arg" != /* ]] && [ -f "$terminal_dir/$arg" ]; then
+      sepc_path="$(realpath "$terminal_dir/$arg")"
+    else
+      echo -e "\033[31mError: Invalid path '$arg'\033[0m"
+      exit 1
+    fi
+    _f="done"
+  elif [ -z "$_d" ] && [[ "$arg" == "-d" ]]; then
+    _d="-d"
+    continue
+  elif [ "$_d" == "-d" ]; then
+    if [[ "$arg" == /* ]] && [ -d "$arg" ]; then
+      sepc_dir="$(realpath "$arg")"
+    elif [[ "$arg" != /* ]] && [ -d "$terminal_dir/$arg" ]; then
+      sepc_dir="$(realpath "$terminal_dir/$arg")"
+    else
+      echo -e "\033[31mError: Invalid directory '$arg'\033[0m"
+      exit 1
+    fi
+    _d="done"
+  else
+    invalid_argument=1
+    echo -e "\033[31mError: Invalid argument '$arg'\033[0m"
+  fi
+done
+
+# 检查参数
+if [ -n "$_f" ] && [[ "$_f" != "done" ]]; then
+  echo -e "\033[31mError: Missing path after -f\033[0m"
+fi
+if [ -n "$_d" ] && [[ "$_d" != "done" ]]; then
+  echo -e "\033[31mError: Missing directory after -d\033[0m"
+fi
+if [ -n "$_f" ] && [ -n "$_d" ]; then
+  echo -e "\033[31mError: Cannot specify both firmware directory and path simultaneously\033[0m"
+  exit
+fi
+if [ -z "$first_arg" ] || [ -n "$invalid_argument" ] ; then
+  usage_function
+fi
+
+# 检查 unzip 是否已安装
+if ! command -v unzip &> /dev/null
+then
+  echo "unzip is not installed."
+  echo "Please run the following command to install unzip:"
+  echo -e "\033[33msudo apt update\033[0m (optional)"
+  echo -e "\033[33msudo apt install unzip\033[0m"
+  exit 1
+fi
+
+# 检查 bc 是否已安装
+if ! command -v bc &> /dev/null
+then
+  echo "bc is not installed."
+  echo "Please run the following command to install bc:"
+  echo -e "\033[33msudo apt update\033[0m (optional)"
+  echo -e "\033[33msudo apt install bc\033[0m"
+  exit 1
+fi
+
+# 确保 Windows 的 cmd 和 powershell 存在且可执行
+win_cmd="/mnt/c/Windows/system32/cmd.exe"
+win_ps1="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+if [ ! -x "$win_cmd" ]; then
+  echo "cmd.exe not found or not executable"
+  exit 1
+fi
+if [ ! -x "$win_ps1" ]; then
+  echo "powershell.exe not found or not executable"
+  exit 1
+fi
+
+# 查找显示串口号
+if [ "$find_com" == "com" ]; then
+  "$win_ps1" -Command " \
+      \$output = Get-WmiObject Win32_SerialPort | \
+      Where-Object { \$_.PNPDeviceID -match 'VID_FFF8&PID_[0-9A-F]{4}&MI_00' } | \
+      Select-Object DeviceID, PNPDeviceID; \
+      if (-not \$output) { \
+          Write-Output 'Watch-Link V3 not found.'; \
+      } \
+      foreach (\$device in \$output) { \
+          \$_PID = (\$device.PNPDeviceID -replace '.*PID_([0-9A-F]{4}).*', '\$1'); \
+          \$COM = \$device.DeviceID; \
+          Write-Output \"Watch-Link V3 (PID:\$_PID)  \$COM\"; \
+      }"
+  exit 1
+fi
+
+# 提示用户输入密码以确保脚本能够使用 sudo
+sudo -v
+
+# 检查 Watch-Link 是否存在
+echo "Check if Watch-Link exists"
+com_info=$("$win_cmd" /C "wmic path Win32_SerialPort get DeviceID,PNPDeviceID" 2>/dev/null \
+                          | grep -E "VID_FFF8&PID_${wl_pid:-[0-9A-F]*}&MI_02")
+com_count=0
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  com=$(echo "$line" | awk '{print $1}')
+  pid=$(echo "$line" | awk -F 'PID_' '{print substr($2, 1, 4)}')
+  com_count=$((com_count + 1))
+  if [ "$com_count" -eq 1 ]; then
+    _com="$com"
+    _pid="$pid"
+  elif [ "$com_count" -eq 2 ]; then
+    echo -e "\033[A\033[2KWatch-Link V3 (PID:$_pid)"
+    echo "Watch-Link V3 (PID:$pid)"
+  elif [ "$com_count" -gt 2 ]; then
+    echo "Watch-Link V3 (PID:$pid)"
+  fi
+  if [ "$_pid" != "$pid" ]; then
+    dif_sn=1
+  fi
+done <<< "$com_info"
+if [ "$com_count" -lt 1 ]; then
+  if [ -n "$wl_pid" ]; then
+    echo -e "\033[A\033[2K\033[31mError: No Watch-Link V3 (PID:$wl_pid) found\033[0m"
+  else
+    echo -e "\033[A\033[2K\033[31mError: No Watch-Link V3 found\033[0m"
+  fi
+  exit 1
+elif [ "$com_count" -gt 1 ]; then
+  if [ -z "$dif_sn" ]; then
+    echo -e "\033[31mError: Multiple Watch-Link V3 found\033[0m"
+  else
+    echo -e "\033[31mError: Multiple Watch-Link V3 found. Please specify the PID\033[0m"
+    echo -e "\033[33mExample: \"v3dl $fw_type PID=$_pid\"\033[0m"
+  fi
+  exit 1
+else
+  tar_com="$_com"
+  wl_pid="$_pid"
+  watch_com=$(echo $("$win_cmd" /C "wmic path Win32_SerialPort get DeviceID,PNPDeviceID
+  " 2>/dev/null | grep -E "VID_FFF8&PID_$wl_pid&MI_00") | awk '{print $1}')
+  echo -e "\033[A\033[2KWatch-Link V3 \033[33m(PID:$wl_pid) $watch_com\033[0m"
+fi
+
+# 函数：串口发送
+com_tx() {
+  local data="$1"
+  local max_retries=5
+  local retry_delay=0.1
+  local attempt=0
+  ps1_cmd="\$port = New-Object System.IO.Ports.SerialPort $tar_com,115200,None,8,One;
+            \$port.Open();
+            \$port.WriteLine('$data');"
+  while [ $attempt -lt $max_retries ]; do
+    output=$( { "$win_ps1" -Command "$ps1_cmd"; } 2>&1 )
+    if [ -n "$output" ]; then
+      attempt=$((attempt + 1))
+      if [ $attempt -ge $max_retries ]; then
+        echo -e "\033[31mFailed to send data to $tar_com\033[0m"
+        trap '' EXIT
+        exit 1
+      fi
+      sleep $retry_delay
+    else
+      break
+    fi
+  done
+}
+
+# 设置加载IMAGE盘失败后退出U盘模式
+trap 'com_tx "WL+DISK=NULL"' EXIT
+
+# 打开VBUS，加载IMAGE盘
+tar_label="IMAGE $wl_pid"
+com_tx "WL+VBUS=ON WL+DISK=IMG WL+BID=$tar_bid"
+echo -e "\033[A\033[2KWatch-Link V3 \033[33m(PID:$wl_pid) $watch_com\033[0m loading... 0s"
+elapsed_time=0
+start_time=$(date +%s.%N)
+next_load_time=$(($(date +%s) + 3))
+while true; do
+  disk_info=$("$win_cmd" /C "wmic logicaldisk where "DriveType=2" get DeviceID, VolumeName \
+                             | findstr /r /c:"$tar_label" " 2>/dev/null)
+  while IFS= read -r line; do
+    dev_id=$(echo "$line" | awk '{print $1}')
+    if [[ $dev_id =~ ^[A-Z]: ]]; then
+      if [ -n "$tar_drv" ]; then
+        echo -e "\033[31mError: Multiple disk ($tar_label) found\033[0m"
+        exit 1
+      fi
+      tar_drv="$dev_id"
+    fi
+  done <<< "$disk_info"
+  if [ -z "$tar_drv" ]; then
+    if [ $(date +%s) -ge $next_load_time ]; then
+      com_tx "WL+VBUS=ON WL+DISK=IMG WL+BID=$tar_bid"
+      next_load_time=$(($(date +%s) + 1))
+    fi
+    elapsed_time="$(printf '%.2f' "$(echo "$(date +%s.%N) - $start_time" | bc -l)")"
+    echo -e "\033[A\033[2KWatch-Link V3 \033[33m(PID:$wl_pid) $watch_com\033[0m loading... ${elapsed_time}s"
+    sleep 0.1
+  else
+    echo -e "\033[A\033[2KWatch-Link V3 \033[33m(PID:$wl_pid) $watch_com\033[0m loaded. ${elapsed_time}s"
+    break
+  fi
+done
+
+# 写OTP硬件版本号
+if [ -n "$write_otp" ]; then
+  "$win_cmd" /C "del "$tar_drv\\$write_otp"" > /dev/null 2>&1
+fi
+
+# 检查是否有固件可用于烧录
+echo "Check if there is firmware available for flashing"
+fw_count=0
+tar_fw="$fw_type*_sign.bin"
+sub_dir="out/$fw_type*/binary"
+file_pat1="$fw_type*_sign.bin"
+file_pat2="$fw_type*.bin"
+case "$fw_type" in
+  boot)
+    ;;
+  app)
+    tar_fw="firmware_sign.bin"
+    sub_dir="out/watch*/binary"
+    file_pat1="firmware*_sign.bin"
+    file_pat2="firmware*.bin"
+    ;;
+  recovery)
+    ;;
+  ota|fm_ota)
+    tar_fw="system@*.img"
+    sub_dir="out/watch*/binary"
+    file_pat1="watch@*_ota_remake_sign.zip"
+    file_pat2="watch@*_ota_sign.zip"
+    ;;
+  coretest)
+    tar_fw="bootloader_sign.bin"
+    ;;
+  fct)
+    ;;
+esac
+chk_tar_fw=$("$win_cmd" /C "dir $tar_drv\\$tar_fw /b" 2>/dev/null | tr -d '\r\n')
+if [ -z "$chk_tar_fw" ]; then
+  echo -e "\033[A\033[2K\033[31mError: No '$tar_fw' was found on the $tar_label ($tar_drv)\033[0m"
+  exit 1
+else
+  tar_fw="$chk_tar_fw"
+fi
+if [ -n "$sepc_dir" ]; then
+  find_dir="$sepc_dir"
+elif [ -n "$sepc_path" ]; then
+  find_dir="$(dirname "$sepc_path")"
+  file_pat1="$(basename  "$sepc_path")"
+  file_pat2="$(basename  "$sepc_path")"
+else
+  find_dir=$(find "$terminal_dir" -type d -maxdepth 3 -path "$terminal_dir/$sub_dir" 2>/dev/null)
+  if [ -z $find_dir ]; then
+    find_dir="$terminal_dir"
+  fi
+fi
+file_pat=$file_pat1
+while true; do
+  while IFS= read -r file; do
+    fw_count=$((fw_count + 1))
+    if [ "$fw_count" -eq 1 ]; then
+      fw_path="$file"
+      fw_dir=$(dirname "$fw_path")
+    elif [ "$fw_count" -eq 2 ]; then
+      echo -e "\033[A\033[2K\033[31mError: Multiple firmware found\033[0m"
+      echo "Found files:"
+      echo "$fw_path"
+      echo "$file"
+    elif [ "$fw_count" -gt 2 ]; then
+      echo "$file"
+    fi
+  done < <(find "$find_dir" -maxdepth 1 -type f -path "$find_dir/$file_pat")
+  if [ "$fw_count" -eq 0 ]; then
+    if [[ "$file_pat" == "$file_pat1" ]] && [ -z "$sepc_path" ]; then
+      file_pat=$file_pat2
+    else
+      echo -e "\033[A\033[2K\033[31mError: No firmware found\033[0m"
+      exit 1
+    fi
+  elif [ "$fw_count" -gt 1 ]; then
+    exit 1
+  else
+    echo -e "\033[A\033[2KFirmware: $(realpath --relative-to="$terminal_dir" "$fw_path")"
+    if [ "$fw_type" == "fm_ota" ]; then
+      bak_fw_name=$("$win_cmd" /C "dir $tar_drv\\watch@*_fw_only_sign.zip /b" 2>/dev/null | tr -d '\r\n')
+      bak_fw_img="$fw_dir/$bak_fw_name"
+      if [ ! -e "$bak_fw_img" ]; then
+        echo -e "\033[33mWarning: Firmware '$(realpath --relative-to="$terminal_dir" "$bak_fw_img")' is missing!\033[0m"
+        bak_fw_img=
+      fi
+    fi
+    break
+  fi
+done
+
+trap '' EXIT
+
+# 函数：镜像生成错误处理
+gen_img_err() {
+  if [ "$1" == "ERR" ]; then
+    img_type="$3"
+    local line_number="$2"
+    local command_content=$(sed -n "${line_number}p" "$0")
+    echo -e "\033[31mError occurred at line $line_number: Command '$(eval echo "$command_content")'"
+    echo -e "Failed to generate the image\033[0m"
+  else
+    img_type="$2"
+  fi
+  # 在这里添加清理动作
+  trap '' ERR
+  trap '' EXIT
+  case "$img_type" in
+    system)
+      sudo umount -l "$mnt_tar" > /dev/null 2>&1
+      sudo rm -rf "$mnt_tar"
+      sudo umount -l "$mnt_img" > /dev/null 2>&1
+      sudo losetup -d "$lo_dev" > /dev/null 2>&1
+      sudo rm -rf "$mnt_img"
+      sudo rm -rf "$unzip_dir"
+      sudo rm -f "$system_img"
+      ;;
+    boot)
+      sudo rm -f "$boot_img"
+      ;;
+    app)
+      sudo rm -f "$app_img"
+      ;;
+    recovery)
+      sudo rm -f "$recovery_img"
+      ;;
+    nvms)
+      sudo rm -f "$nvms_cfg_txt"
+      sudo rm -f "$nvms_img"
+      ;;
+  esac
+  sudo rm -f "$LOCKFILE"
+  com_tx "WL+DISK=NULL"
+  exit 1
+}
+
+# 检查OTA包生成对应镜像
+if [ "$fw_type" == "ota" ] || [ "$fw_type" == "fm_ota" ]; then
+  trap 'gen_img_err 'EXIT''        EXIT
+  trap 'gen_img_err 'ERR' $LINENO' ERR
+  img_dir="$fw_dir/img"
+  if [ ! -d "$img_dir" ]; then sudo mkdir $img_dir; fi
+  sudo chmod 777 "$img_dir"
+  LOCKFILE="$img_dir/file.lock"
+  exec 200>"$LOCKFILE"
+  echo "The images are being generated"
+  while true; do
+    if ! flock -n 200; then
+      sleep 0.5
+    else
+      # system
+      system_img="$img_dir/$tar_fw"
+      if [ "$(date -r "$fw_path" +%s)" != "$(date -r "$system_img" +%s 2>/dev/null)" ]; then
+        trap 'gen_img_err 'EXIT' 'system''        EXIT
+        trap 'gen_img_err 'ERR' $LINENO 'system'' ERR
+        echo "Formatting SYSTEM partition"
+        "$win_cmd" /C "del "$tar_drv\\cmd_format_system"" > /dev/null 2>&1
+        # 挂载目标驱动器获取SYSTEM镜像大小
+        echo -e "\033[A\033[2KMount $tar_label ($tar_drv)"
+        mnt_tar="$img_dir/mnt_$wl_pid"
+        if [ ! -d "$mnt_tar" ]; then sudo mkdir $mnt_tar; fi
+        sudo chmod 777 "$mnt_tar"
+        sudo mount -t drvfs "$tar_drv" "$mnt_tar"
+        echo -e "\033[A\033[2KRetrieve system image parameters"
+        img_size_max=$(stat -c %s "$mnt_tar/$tar_fw")
+        # 挂载目标驱动器中的SYSTEM镜像，获取可用容量后卸载镜像
+        lo_dev=$(sudo losetup -f)
+        sudo losetup "$lo_dev" "$mnt_tar/$tar_fw"
+        mnt_img="$mnt_tar.system_img"
+        if [ ! -d "$mnt_img" ]; then sudo mkdir $mnt_img; fi
+        sudo chmod 777 "$mnt_img"
+        sudo mount "$lo_dev" "$mnt_img"
+        available_space=$(df -B 1 "$lo_dev" | awk 'NR==2 {print $4}')
+        sudo umount -l "$mnt_img" > /dev/null
+        sudo losetup -d "$lo_dev"
+        # 从目标驱动器提取数据创建空白文件系统镜像
+        echo -e "\033[A\033[2KCreate an empty system image"
+        bytes_to_extract=$((img_size_max - available_space))
+        head -c "$bytes_to_extract" "$mnt_tar/$tar_fw" > "$system_img"
+        truncate -s +$available_space "$system_img"
+        # 卸载目标驱动器并清理
+        sudo umount -l "$mnt_tar" > /dev/null
+        sudo rm -rf "$mnt_tar"
+        # 挂载空白文件系统镜像
+        echo -e "\033[A\033[2KMount empty system image"
+        lo_dev=$(sudo losetup -f)
+        sudo losetup "$lo_dev" "$system_img"
+        sudo mount "$lo_dev" "$mnt_img"
+        # 解压全量OTA包并复制到镜像中
+        echo -e "\033[A\033[2KDecompressing files into system image"
+        unzip_dir="$img_dir/unzip"
+        sudo rm -rf "$unzip_dir"
+        sudo mkdir "$unzip_dir"
+        sudo chmod 777 "$unzip_dir"
+        sudo unzip -q "$fw_path" -d "$unzip_dir"
+        sudo mv "$unzip_dir/META/"* "$mnt_img"
+        sudo mv "$unzip_dir/filehash" "$mnt_img"
+        sudo rm -rf "$unzip_dir"
+        available_space=$(df -B 1 "$lo_dev" | awk 'NR==2 {print $4}')
+        if (( available_space > 1048576 )); then
+          available_space=$((available_space - 1048576))
+        else
+          available_space=0
+        fi
+        # 卸载镜像并清理
+        echo -e "\033[A\033[2KUnmount system image"
+        sudo umount -l "$mnt_img" > /dev/null
+        sudo losetup -d "$lo_dev"
+        sudo rm -rf "$mnt_img"
+        # 成功生成镜像
+        echo -e "\033[A\033[2KMinimize system image"
+        sudo truncate -s -"${available_space}" "$system_img"
+        touch -d "$(date -d @$(date -r "$fw_path" +%s) '+%Y-%m-%d %H:%M:%S')" "$system_img"
+        echo -e "\033[A\033[2K\033[A"
+        trap 'gen_img_err 'EXIT''        EXIT
+        trap 'gen_img_err 'ERR' $LINENO' ERR
+      fi
+      update_script=$(unzip -p "$fw_path" update-script)
+      # boot
+      if echo "$update_script" | grep -q "write_image.*boot"; then
+        boot_img="$img_dir/bootloader_sign.bin"
+        if [ "$(date -r "$fw_path" +%s)" != "$(date -r "$boot_img" +%s 2>/dev/null)" ]; then
+          echo "Decompressing boot image"
+          trap 'gen_img_err 'EXIT' 'boot''        EXIT
+          trap 'gen_img_err 'ERR' $LINENO 'boot'' ERR
+          sudo unzip -p "$fw_path" META/bootloader*.bin > "$boot_img"
+          touch -d "$(date -d @$(date -r "$fw_path" +%s) '+%Y-%m-%d %H:%M:%S')" "$boot_img"
+          echo -e "\033[A\033[2K\033[A"
+          trap 'gen_img_err 'EXIT''        EXIT
+          trap 'gen_img_err 'ERR' $LINENO' ERR
+        fi
+      fi
+      # app
+      if echo "$update_script" | grep -q "write_image.*app"; then
+        app_img="$img_dir/firmware_sign.bin"
+        if [ "$(date -r "$fw_path" +%s)" != "$(date -r "$app_img" +%s 2>/dev/null)" ]; then
+          echo "Decompressing app image"
+          trap 'gen_img_err 'EXIT' 'app''        EXIT
+          trap 'gen_img_err 'ERR' $LINENO 'app'' ERR
+          sudo unzip -p "$fw_path" META/firmware*.bin > "$app_img"
+          touch -d "$(date -d @$(date -r "$fw_path" +%s) '+%Y-%m-%d %H:%M:%S')" "$app_img"
+          echo -e "\033[A\033[2K\033[A"
+          trap 'gen_img_err 'EXIT''        EXIT
+          trap 'gen_img_err 'ERR' $LINENO' ERR
+        fi
+      fi
+      # recovery
+      if unzip -l "$fw_path" | grep -q 'META/extfw/recovery.*\.bin'; then
+        recovery_img="$img_dir/recovery_sign.bin"
+        if [ "$(date -r "$fw_path" +%s)" != "$(date -r "$recovery_img" +%s 2>/dev/null)" ]; then
+          echo "Decompressing recovery image"
+          trap 'gen_img_err 'EXIT' 'recovery''        EXIT
+          trap 'gen_img_err 'ERR' $LINENO 'recovery'' ERR
+          sudo unzip -p "$fw_path" META/extfw/recovery*.bin > "$recovery_img"
+          touch -d "$(date -d @$(date -r "$fw_path" +%s) '+%Y-%m-%d %H:%M:%S')" "$recovery_img"
+          echo -e "\033[A\033[2K\033[A"
+          trap 'gen_img_err 'EXIT''        EXIT
+          trap 'gen_img_err 'ERR' $LINENO' ERR
+        fi
+      fi
+      break
+    fi
+  done
+  flock -u 200
+  # nvms
+  if [ "$fw_type" == "fm_ota" ]; then
+    echo "Creating nvms image"
+    trap 'gen_img_err 'EXIT' 'nvms''        EXIT
+    trap 'gen_img_err 'ERR' $LINENO 'nvms'' ERR
+    nvms_dir="$img_dir/nvms_$wl_pid"
+    if [ ! -d "$nvms_dir" ]; then sudo mkdir $nvms_dir; fi
+    sudo chmod 777 "$nvms_dir"
+    nvms_cfg_txt="$nvms_dir/nvms_cfg.txt"
+    > $nvms_cfg_txt
+    nvms_cfg_data=$("$win_ps1" -Command "
+    try { \$content = Get-Content -Path '$tar_drv/nvms_cfg.txt' -ErrorAction Stop -Encoding UTF8 } catch { }
+    foreach (\$line in \$content) {
+        if (-not \$sn -and \$line -match '序列号码：\"(.+?)\"') { \$sn = \$matches[1].Trim().TrimStart('?') }
+        elseif (-not \$hw -and \$line -match '硬件版本：\"(.+?)\"') { \$hw = \$matches[1].Trim().TrimStart('?') }
+        if (\$sn -and \$hw) { break }
+    }
+    Write-Output SN=\$sn
+    Write-Output HW=\$hw")
+    tar_sn=$(echo "$nvms_cfg_data" | grep -oP 'SN=\K[^ ]+' | tr -d '\r\n')
+    tar_hw=$(echo "$nvms_cfg_data" | grep -oP 'HW=\K[^ ]+' | tr -d '\r\n')
+    if [ -z "$tar_sn" ]; then
+      tar_sn="TEST$(cat /dev/urandom | tr -dc '0-9A-F' | fold -w 6 | head -n 1)"
+      printf "序列号码：\"${tar_sn}\"\n" >> $nvms_cfg_txt
+    fi
+    if [ -n "$hw_rev" ]; then
+      printf "硬件版本：\"${hw_rev}\"\n" >> $nvms_cfg_txt
+    fi
+    printf "启动模式：\"USER\"\n" >> $nvms_cfg_txt
+    printf "$(printf '%.0s ' {1..4096})" >> $nvms_cfg_txt
+    nvms_img="$nvms_dir/nvms.bin"
+    "$win_cmd" /C "copy /Y "$(wslpath -w "$nvms_cfg_txt")" "$tar_drv\\nvms_cfg.txt" & \
+    del "$tar_drv\\nvms_cfg.txt" & copy /Y "$tar_drv\\nvms.bin" "$(wslpath -w "$nvms_dir")\\nvms.bin"" > /dev/null 2>&1
+    sudo rm -f "$nvms_cfg_txt"
+    if [ ! -e "$nvms_img" ]; then
+      exit 1
+    fi
+    echo -e "\033[A\033[2K\033[A"
+    trap 'gen_img_err 'EXIT''        EXIT
+    trap 'gen_img_err 'ERR' $LINENO' ERR
+  fi
+  find "$img_dir" -type f ! -wholename "$system_img" ! -wholename "$boot_img" \
+  ! -wholename "$app_img" ! -wholename "$recovery_img" ! -name "nvms.bin" -delete
+  find "$img_dir" -type d ! -wholename "$img_dir" ! -name "nvms_*" -delete
+  echo -e "\033[A\033[2K\033[A"
+  if [ -z "$hw_rev" ] && [[ "$tar_hw" == "0xFFFFFFFF" ]]; then
+    echo -e "\033[33mWarning: Hardware revision not specified!\033[0m"
+  fi
+  trap '' ERR
+  trap '' EXIT
+fi
+
+# 函数：烧录固件
+update_fw() {
+  tmp_log=$(mktemp)
+  src="$(wslpath -w "$fw_path")"
+  dst="$tar_drv\\$dst_fw"
+  filePaths="$filePaths=$tar_drv$dst_fw"
+  if [ "$fw_type_disp" == "system" ]; then
+    fw_dir_win=$(wslpath -w "$img_dir")
+    "$win_cmd" /C "robocopy $fw_dir_win $tar_drv\\ $dst_fw /IS /NJH /NDL /NJS /R:0 /W:0" > "$tmp_log" 2>&1 &
+  else
+    "$win_ps1" -Command "
+    try
+    {
+        \$srcSize    = [System.IO.FileInfo]::new('$src').Length
+        \$srcStream  = [System.IO.File]::Open('$src', [System.IO.FileMode]::Open, \
+                       [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        \$destStream = [System.IO.File]::Open('$dst', [System.IO.FileMode]::Open, \
+                       [System.IO.FileAccess]::Write)
+        \$destStream.SetLength(1)
+        \$destStream.SetLength(\$srcSize)
+        \$bufSize = \$srcSize / 100 / 4096 * 4096
+        \$bufSize = [Math]::Max(262144, [Math]::Min(1048576, \$bufSize))
+        \$buf        = [byte[]]::new(\$bufSize)
+        \$totalWrite = 0
+        while ((\$read = \$srcStream.Read(\$buf, 0, \$bufSize)) -gt 0)
+        {
+          \$destStream.Write(\$buf, 0, \$read)
+          \$totalWrite += \$read
+          \$progressPercent = (\$totalWrite / \$srcSize) * 100
+          Write-Output (\"{0:N1}%\" -f \$progressPercent)
+        }
+        Write-Output '100%'
+    }
+    catch { Write-Output 'error' }
+    finally { if (\$srcStream  -ne \$null) { \$srcStream.Close()  }
+              if (\$destStream -ne \$null) { \$destStream.Close() } } \
+    " > "$tmp_log" 2>&1 &
+  fi
+  cmd_pid=$!
+  start_time=$(date +%s.%N)
+  fw_type_disp=$(echo "$fw_type_disp" | tr '[:lower:]' '[:upper:]')
+  size=$(stat -c%s "$fw_path")
+  if [ $size -gt 1048575999 ]; then
+    size_disp="$(printf '%.2f' "$(echo "scale=2; $size / 1073741824 / 1" | bc -l)")GB"
+  elif [ $size -gt 1023999 ]; then
+    size_disp="$(printf '%.2f' "$(echo "scale=2; $size / 1048576 / 1" | bc -l)")MB"
+  else
+    size_disp="$(printf '%.2f' "$(echo "scale=2; $size / 1024 / 1" | bc -l)")KB"
+  fi
+  progress_max=10
+  progress=""
+  echo -e "$(printf "| %-8s | %8s | %7.2fs | %10s | %${progress_max}s %5.1f%% |" \
+  "$fw_type_disp" "$size_disp" "0" "0KB/s" "$progress" "0")"
+  while true; do
+    last_perc="$(grep -o '[0-9]*\.[0-9]*%' "$tmp_log" | tail -n 1)"
+    if [ -n "$last_perc" ]; then
+      end_time=$(date +%s.%N)
+      perc_disp="${last_perc%?}"
+      dec_perc=$(echo "$perc_disp / 100" | bc -l)
+      progress_len="$(echo "scale=0; $dec_perc * $progress_max / 1" | bc -l)"
+      if [ "$progress_len" -eq 0 ]; then
+        progress="\033[1m\033[90m$(printf '=%.0s' $(seq 1 $progress_max))\033[0m"
+      else
+        if [ "$progress_len" -lt "$progress_max" ]; then
+          progress1="\033[1m\033[90m$(printf '=%.0s' $(seq 1 $((progress_max - progress_len))))\033[0m"
+        else
+          progress1=""
+        fi
+        progress="\033[1m\033[32m$(printf '=%.0s' $(seq 1 "$progress_len"))\033[0m$progress1"
+      fi
+      dur=$(echo "$end_time - $start_time" | bc -l)
+      write_kb=$(echo "$size * $dec_perc / 1024" | bc -l)
+      speed_kb=$(echo "$write_kb / $dur" | bc -l)
+      if (( $(echo "$speed_kb < 1000" | bc -l) )); then
+        speed_disp="$(printf '%.2f' "$(echo "scale=2; $speed_kb / 1" | bc -l)")KB/s"
+      else
+        speed_disp="$(printf '%.2f' "$(echo "scale=2; $speed_kb / 1024 / 1" | bc -l)")MB/s"
+      fi
+      echo -e "\033[A\033[2K$(printf "| %-8s | %8s | %7.2fs | %10s | %s %5.1f%% |" \
+      "$fw_type_disp" "$size_disp" "$dur" "$speed_disp" "$progress" "$perc_disp")"
+    fi
+    if ! kill -0 $cmd_pid 2>/dev/null; then
+      end_time=$(date +%s.%N)
+      break
+    fi
+    sleep 0.1
+  done
+  wait $cmd_pid
+  if [ "$(grep -o '[0-9]\+%' "$tmp_log" | tail -n 1)" != "100%" ]; then
+    exit 1
+  elif [ "$last_perc" != "100.0%" ]; then
+    dur=$(echo "scale=2; ($end_time - $start_time) / 1" | bc -l)
+    speed_kb=$(echo "scale=2; $size / 1024 / $dur / 1" | bc -l)
+    if (( $(echo "$speed_kb < 1000" | bc -l) )); then
+      speed_disp="${speed_kb}KB/s"
+    else
+      speed_disp="$(echo "scale=2; $speed_kb / 1024 / 1" | bc -l)MB/s"
+    fi
+    progress="\033[1m\033[32m$(printf '=%.0s' $(seq 1 $progress_max))\033[0m"
+    echo -e "\033[A\033[2K$(printf "| %-8s | %8s | %7.2fs | %10s | %s %5.1f%% |" \
+    "$fw_type_disp" "$size_disp" "$dur" "$speed_disp" "$progress" "100")"
+  fi
+  sudo rm -f "$tmp_log"
+}
+
+# 函数：烧录退出后的清理
+cleanup() {
+  echo -e "\033[2K\033[0G$(printf '%.0s-' {1..67})"
+  if [ -z "$1" ]; then
+    # 检查烧录结果
+    check_result
+  fi
+  Program_time="$(printf '%.2f' "$(echo "$(date +%s.%N) - $Program_time_start" | bc -l)")"
+  echo "Programming time: "$Program_time"s.  Date: $(date +"%Y-%m-%d %H:%M:%S")"
+  sudo rm -f "$tmp_log"
+  if [ -n "$1" ]; then
+    echo -e "\r\n\033[31mFailed to update $fw_type_disp\033[0m"
+  fi
+  trap '' ERR
+  trap '' EXIT
+  com_tx "WL+DISK=NULL"
+}
+
+# 函数：检查烧录结果
+check_result() {
+  echo "Checking the programming results..."
+  prog_result="$("$win_ps1" -Command "
+  \$filePathsArray = '$filePaths' -split '='
+  Remove-Item '$tar_drv\\cmd_reload' -ErrorAction SilentlyContinue
+  foreach (\$path in \$filePathsArray)
+  {
+    if (-not \$path.Trim()) { continue }
+    \$retryCount = 0; \$success = \$false
+    while (\$retryCount -lt 3 -and !\$success)
+    {
+      try
+      {
+        \$fileInfo = Get-Item -Path \$path -ErrorAction Stop
+        \$timestamp = [int]((\$fileInfo.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds)
+        if (\$timestamp -eq 315532800) { Write-Output \"Failed to update '\$(Split-Path -Path \$path -Leaf )'\" }
+        \$success = \$true
+      } catch { \$retryCount++; if (\$retryCount -eq 3) { Write-Output \"'\$path' no found\" } }
+    }
+  }")"
+  if [ -z "$prog_result" ]; then
+    echo -e "\033[A\033[2K\033[A"
+  else
+    echo -e "\033[A\033[2K\033[31m$prog_result\033[0m"
+  fi
+}
+
+# 记录开始时间
+Program_time_start=$(date +%s.%N)
+
+# 格式化手表
+if [ "$fw_type" == "fm_ota" ]; then
+  trap 'echo -e "\033[A\033[2K\033[0G\033[31mFormatting failure.\033[0m";
+  com_tx "WL+DISK=NULL"; trap '' ERR; trap '' EXIT; exit 1' EXIT
+  trap 'echo -e "\033[A\033[2K\033[0G\033[31mFormatting failure.\033[0m";
+  com_tx "WL+DISK=NULL"; trap '' ERR; trap '' EXIT; exit 1' ERR
+  echo "Formatting..."
+  start_time=$(date +%s.%N)
+  # 设置手表用户信息
+  if [ -n "$set_user_data" ]; then
+    set_user_data="${tar_drv}$set_user_data"
+  fi
+  "$win_cmd" /C "del "$tar_drv\\cmd_format_disk" "$tar_drv\\cmd_format_env" \
+  "$tar_drv\\*.log" "$set_user_data" "$tar_drv\\cmd_reload"" 2>/dev/null &
+  cmd_pid=$!
+  while true; do
+    echo -e "\033[A\033[2KFormatting... $(printf '%.2fs' "$(echo "$(date +%s.%N) - $start_time" | bc -l)")"
+    if ! kill -0 $cmd_pid 2>/dev/null; then
+      echo -e "\033[A\033[2KFormatting complete. $(printf '%.2fs' "$(echo "$(date +%s.%N) - $start_time" | bc -l)")"
+      break
+    fi
+    sleep 0.1
+  done
+  wait $cmd_pid
+fi
+# 开始烧录固件
+trap 'cleanup 'START'' EXIT
+trap 'cleanup 'START'' ERR
+filePaths=""
+echo "$(printf '%.0s-' {1..67})"
+case "$fw_type" in
+  boot|app|recovery|fct|coretest)
+    fw_type_disp="$fw_type"
+    dst_fw="$tar_fw"
+    update_fw
+    ;;
+  ota|fm_ota)
+    if [ "$fw_type" == "fm_ota" ]; then
+      fw_path=$nvms_img
+      dst_fw="nvms.bin"
+      fw_type_disp="nvms"
+      update_fw
+    fi
+    if [ -n "$recovery_img" ]; then
+      fw_path=$recovery_img
+      dst_fw=$(basename "$fw_path")
+      fw_type_disp="recovery"
+      update_fw
+    fi
+    if [[ "$fw_type" == "fm_ota" ]] && [ -n "$bak_fw_img" ]; then
+      fw_path="$bak_fw_img"
+      dst_fw="$bak_fw_name"
+      fw_type_disp="bak_fw"
+      update_fw
+    fi
+    if [ -n "$boot_img" ]; then
+      fw_path=$boot_img
+      dst_fw=$(basename "$fw_path")
+      fw_type_disp="boot"
+      update_fw
+    fi
+    if [ -n "$app_img" ]; then
+      fw_path=$app_img
+      dst_fw=$(basename "$fw_path")
+      fw_type_disp="app"
+      update_fw
+    fi
+    fw_path=$system_img
+    dst_fw="$tar_fw"
+    fw_type_disp="system"
+    update_fw
+    "$win_cmd" /C "del $tar_drv\\cmd_set_upgrade_extfw" > /dev/null 2>&1
+    ;;
+esac
+trap 'cleanup' EXIT
+trap 'cleanup' ERR
+# 同步电脑时间到手表
+if [ -n "$sync_time" ]; then
+  "$win_ps1" -Command "
+  \$hexTimestamp = \"0x\"+\$(([System.DateTimeOffset](Get-Date).ToUniversalTime()).ToUnixTimeSeconds() + 1).ToString(\"X8\")
+  \$byteContent = ([System.Text.Encoding]::UTF8).GetBytes(\"\$hexTimestamp\$(new-object string(' ', 4086))\")
+  try{
+    \$destStream = [System.IO.File]::Open('$tar_drv\\sync_the_time.bat', [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write)
+    \$destStream.SetLength(1); \$destStream.SetLength(\$byteContent.Length)
+    \$destStream.Write(\$byteContent, 0, \$byteContent.Length)
+  } finally { if (\$destStream -ne \$null) { \$destStream.Close() } }"
+fi
